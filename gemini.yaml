@@ -1,0 +1,130 @@
+name: Gemini AI Partner
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+jobs:
+  gemini_process:
+    if: contains(github.event.comment.body, '@gemini')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Google AI Library
+        run: pip install -q -U google-generativeai
+
+      - name: Gemini AI Logic
+        id: gemini
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+        run: |
+          python << 'EOF'
+          import os
+          import sys
+          import google.generativeai as genai
+
+          def run():
+              api_key = os.environ.get("GEMINI_API_KEY")
+              if not api_key:
+                  print("::error::GEMINI_API_KEY が設定されていません。")
+                  sys.exit(1)
+
+              genai.configure(api_key=api_key)
+              model = genai.GenerativeModel('gemini-3-flash-preview')
+
+              prompt = f"""
+              あなたはシニアエンジニアです。指示を解析し、以下に従ってください。
+              1. コード修正が必要なら ```bash ... ``` 形式のスクリプトを出力。
+              2. 質問や助言なら、そのまま日本語で回答。
+              
+              [超重要：自動実行の徹底]
+              - .github/workflows. 配下のファイルは、作成・変更しないでください。
+              - デプロイ設定(.github/workflows/deploy.yml)については自動で作成せず、issue内のコメントで作成意図と記載内容をチャットして下さい。
+              - すべての npm/npx コマンドには必ず `--yes` (または `-y`) を付けてください。
+              - 既存のディレクトリに Vite を展開する場合、必ず `--yes` を付けて「ディレクトリが空でない」という警告をスキップさせてください。
+              - 例: `npm create vite@latest . --yes -- --template react-ts`
+              
+              指示内容: {os.environ.get('COMMENT_BODY')}
+              対象Issue: {os.environ.get('ISSUE_TITLE')}
+              """
+
+              try:
+                  response = model.generate_content(prompt)
+                  res_text = response.text
+                  
+                  if "```bash" in res_text:
+                      parts = res_text.split("```bash")
+                      explanation = parts[0].strip()
+                      script = parts[1].split("```")[0].strip()
+                      with open("explanation.md", "w", encoding="utf-8") as f: f.write(explanation)
+                      with open("update_code.sh", "w", encoding="utf-8") as f: f.write(script)
+                      with open(os.environ['GITHUB_OUTPUT'], 'a') as f: f.write("has_fix=true\n")
+                  else:
+                      with open("explanation.md", "w", encoding="utf-8") as f: f.write(res_text)
+                      with open(os.environ['GITHUB_OUTPUT'], 'a') as f: f.write("has_fix=false\n")
+              except Exception as e:
+                  print(f"::error::Python Error: {e}")
+                  sys.exit(1)
+          run()
+          EOF
+
+      - name: Git Push with Auth
+        if: steps.gemini.outputs.has_fix == 'true'
+        id: git_push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # <<<< 【追加】環境変数 CI を true にして npm の対話を抑制
+          CI: true
+        run: |
+          BRANCH_NAME="gemini-fix-${{ github.event.issue.number }}"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git checkout -b "$BRANCH_NAME" || git checkout "$BRANCH_NAME"
+          
+          chmod +x update_code.sh
+          # <<<< 【追加】実行時にも対話を抑制するフラグを付与
+          ./update_code.sh || { echo "::error::スクリプト実行失敗。ログを確認してください。"; exit 1; }
+          
+          git add .
+          if ! git diff --cached --exit-code; then
+            git commit -m "AI suggested changes from Issue #${{ github.event.issue.number }}"
+            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" "$BRANCH_NAME" --force || { echo "::error::GitHubへのプッシュに失敗しました。"; exit 1; }
+            
+            COMPARE_URL="${{ github.server_url }}/${{ github.repository }}/compare/main...${BRANCH_NAME}?expand=1"
+            echo "pr_link=$COMPARE_URL" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::変更なし"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post Final Comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "### 🤖 Geminiからの返答" > final_comment.md
+          cat explanation.md >> final_comment.md
+          
+          if [ "${{ steps.git_push.outputs.has_changes }}" == "true" ]; then
+            echo -e "\n\n---\n### 🛠 修正案を確認してください\n[👉 ここをクリックしてプルリクエストを作成](${{ steps.git_push.outputs.pr_link }})" >> final_comment.md
+          fi
+          
+          gh issue comment ${{ github.event.issue.number }} --body-file final_comment.md
